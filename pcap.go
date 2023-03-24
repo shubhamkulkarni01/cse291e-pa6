@@ -3,11 +3,11 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -27,8 +27,12 @@ type Row struct {
 	RelativeVolume float64
 }
 
-func processData(packetChannel <-chan gopacket.Packet,
-	metadataChannel <-chan Metadata,
+type DecoratedPacket struct {
+	packet   gopacket.Packet
+	metadata Metadata
+}
+
+func processData(decoratedPacketChannel <-chan DecoratedPacket,
 	constructKey func(gopacket.Packet, Metadata) Key,
 	NilKey func() Key,
 	stringify func(Key) []string) [][]string {
@@ -38,8 +42,9 @@ func processData(packetChannel <-chan gopacket.Packet,
 	total_packets := int64(0)
 	total_length := int64(0)
 
-	for packet := range packetChannel {
-		metadata := <-metadataChannel
+	for decoratedPacket := range decoratedPacketChannel {
+		packet := decoratedPacket.packet
+		metadata := decoratedPacket.metadata
 
 		if packet == nil {
 			fmt.Println("broken")
@@ -92,8 +97,8 @@ func processData(packetChannel <-chan gopacket.Packet,
 	return table
 }
 
-func ProtocolPortCounter(packetChannel <-chan gopacket.Packet, metadataChannel <-chan Metadata) (string, []string, [][]string) {
-	filename := "protocol_port_counter.csv"
+func VolumeByProtocolPort(decoratedPacketChannel <-chan DecoratedPacket) (string, []string, [][]string) {
+	filename := "volume_by_protocol_port.csv"
 	header := []string{"Protocol", "Port", "Count", "Volume", "RelativeCount", "RelativeVolume"}
 	type MyKey struct {
 		Key
@@ -107,36 +112,39 @@ func ProtocolPortCounter(packetChannel <-chan gopacket.Packet, metadataChannel <
 	stringify := func(key Key) []string {
 		return []string{key.(MyKey).Protocol, fmt.Sprintf("%d", key.(MyKey).Port)}
 	}
+
+	layerClass := gopacket.NewLayerClass([]gopacket.LayerType{layers.LayerTypeTCP, layers.LayerTypeUDP, layers.LayerTypeICMPv4})
+
 	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
-		layerClass := gopacket.NewLayerClass([]gopacket.LayerType{layers.LayerTypeTCP, layers.LayerTypeUDP, layers.LayerTypeICMPv4})
+		key := MyKey{Protocol: packet.NetworkLayer().(*layers.IPv4).Protocol.String(), Port: -1}
 
 		layer := packet.LayerClass(layerClass)
-		if layer == nil {
-			return NilKey()
+		if layer != nil {
+			switch layer.LayerType() {
+			case layers.LayerTypeTCP:
+				key.Port = int(layer.(*layers.TCP).DstPort)
+				return key
+
+			case layers.LayerTypeUDP:
+				key.Port = int(layer.(*layers.UDP).DstPort)
+				return key
+
+			case layers.LayerTypeICMPv4:
+				key.Port = int(layer.(*layers.ICMPv4).TypeCode)
+				return key
+
+			}
 		}
-		switch layer.LayerType() {
-		case layers.LayerTypeTCP:
-			tcp, _ := layer.(*layers.TCP)
-			key := MyKey{Protocol: "tcp", Port: int(tcp.DstPort)}
-			return key
+		return key
 
-		case layers.LayerTypeUDP:
-			udp, _ := layer.(*layers.UDP)
-			key := MyKey{Protocol: "udp", Port: int(udp.DstPort)}
-			return key
-
-		case layers.LayerTypeICMPv4:
-			icmp, _ := layer.(*layers.ICMPv4)
-			key := MyKey{Protocol: "icmp", Port: int(icmp.TypeCode)}
-			return key
-
-		}
-		return NilKey()
 	}
-	return filename, header, processData(packetChannel, metadataChannel, constructKey, NilKey, stringify)
+	if len(stringify(NilKey())) != len(header)-4 {
+		panic("header length does not match key length")
+	}
+	return filename, header, processData(decoratedPacketChannel, constructKey, NilKey, stringify)
 }
 
-func VolumeBySourceCountry(packetChannel <-chan gopacket.Packet, metadataChannel <-chan Metadata) (string, []string, [][]string) {
+func VolumeBySourceCountry(decoratedPacketChannel <-chan DecoratedPacket) (string, []string, [][]string) {
 	filename := "volume_by_source_country.csv"
 	header := []string{"NetacqCountry", "MaxmindCountry", "Count", "Volume", "RelativeCount", "RelativeVolume"}
 
@@ -156,11 +164,14 @@ func VolumeBySourceCountry(packetChannel <-chan gopacket.Packet, metadataChannel
 	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
 		return MyKey{NetacqCountry: metadata.NetacqCountry, MaxmindCountry: metadata.MaxmindCountry}
 	}
+	if len(stringify(NilKey())) != len(header)-4 {
+		panic("header length does not match key length")
+	}
 
-	return filename, header, processData(packetChannel, metadataChannel, constructKey, NilKey, stringify)
+	return filename, header, processData(decoratedPacketChannel, constructKey, NilKey, stringify)
 }
 
-func VolumeBySourceAS(packetChannel <-chan gopacket.Packet, metadataChannel <-chan Metadata) (string, []string, [][]string) {
+func VolumeBySourceAS(decoratedPacketChannel <-chan DecoratedPacket) (string, []string, [][]string) {
 	filename := "volume_by_source_as.csv"
 
 	type MyKey struct {
@@ -180,8 +191,154 @@ func VolumeBySourceAS(packetChannel <-chan gopacket.Packet, metadataChannel <-ch
 	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
 		return MyKey{SrcASN: metadata.SrcASN}
 	}
+	if len(stringify(NilKey())) != len(header)-4 {
+		panic("header length does not match key length")
+	}
 
-	return filename, header, processData(packetChannel, metadataChannel, constructKey, NilKey, stringify)
+	return filename, header, processData(decoratedPacketChannel, constructKey, NilKey, stringify)
+}
+
+func ScannerAnalysis(decoratedPacketChannel <-chan DecoratedPacket) (string, []string, [][]string) {
+	filename := "scanning_campaign.csv"
+
+	type MyKey struct {
+		Scanner  string
+		Protocol string
+		Port     int
+	}
+
+	header := []string{"Scanner", "Protocol", "Port", "Count", "Volume", "RelativeCount", "RelativeVolume"}
+
+	stringify := func(key Key) []string {
+		return []string{
+			key.(MyKey).Scanner,
+			key.(MyKey).Protocol,
+			fmt.Sprint(key.(MyKey).Port),
+		}
+	}
+	NilKey := func() Key {
+		return MyKey{Scanner: "", Protocol: "", Port: -1}
+	}
+	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
+		layerClass := gopacket.NewLayerClass([]gopacket.LayerType{layers.LayerTypeTCP, layers.LayerTypeUDP})
+
+		layer := packet.LayerClass(layerClass)
+		if layer == nil {
+			return NilKey()
+		}
+		protocol := ""
+		port := -1
+		switch layer.LayerType() {
+		case layers.LayerTypeTCP:
+			tcp, _ := layer.(*layers.TCP)
+			protocol = layer.LayerType().String()
+			port = int(tcp.DstPort)
+			break
+
+		case layers.LayerTypeUDP:
+			udp, _ := layer.(*layers.UDP)
+			protocol = layer.LayerType().String()
+			port = int(udp.DstPort)
+			break
+		}
+		// port := layer
+
+		if metadata.KnownScanner != "" {
+			return MyKey{Scanner: metadata.KnownScanner, Protocol: protocol, Port: port}
+		} else if metadata.IsBogon {
+			return MyKey{Scanner: "Bogon", Protocol: protocol, Port: port}
+		} else if metadata.IsMasscan {
+			return MyKey{Scanner: "Masscan", Protocol: protocol, Port: port}
+		} else if metadata.IsMirai {
+			return MyKey{Scanner: "Mirai", Protocol: protocol, Port: port}
+		} else if metadata.IsZmap {
+			return MyKey{Scanner: "ZMap", Protocol: protocol, Port: port}
+		}
+		return NilKey()
+	}
+
+	if len(stringify(NilKey())) != len(header)-4 {
+		panic("header length does not match key length")
+	}
+
+	return filename, header, processData(decoratedPacketChannel, constructKey, NilKey, stringify)
+}
+
+func TimeSeriesHourCountry(decoratedPacketChannel <-chan DecoratedPacket) (string, []string, [][]string) {
+	filename := "time_series_hour_country.csv"
+
+	type MyKey struct {
+		Date           string
+		NetacqCountry  string
+		MaxmindCountry string
+	}
+
+	header := []string{"Date", "NetacqCountry", "MaxmindCountry", "Count", "Volume", "RelativeCount", "RelativeVolume"}
+
+	stringify := func(key Key) []string {
+		return []string{
+			key.(MyKey).Date,
+			key.(MyKey).NetacqCountry,
+			key.(MyKey).MaxmindCountry,
+		}
+	}
+	NilKey := func() Key {
+		return MyKey{Date: "", NetacqCountry: "unknown", MaxmindCountry: "unknown"}
+	}
+	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
+		return MyKey{Date: packet.Metadata().Timestamp.Truncate(time.Hour).String(), NetacqCountry: metadata.NetacqCountry, MaxmindCountry: metadata.MaxmindCountry}
+	}
+
+	if len(stringify(NilKey())) != len(header)-4 {
+		panic("header length does not match key length")
+	}
+
+	return filename, header, processData(decoratedPacketChannel, constructKey, NilKey, stringify)
+}
+
+func InternetBackscatter(decoratedPacketChannel <-chan DecoratedPacket) (string, []string, [][]string) {
+	filename := "internet_backscatter.csv"
+
+	type MyKey struct {
+		dest_ip string
+		ASN     string
+	}
+
+	header := []string{"dest_ip", "ASN", "Count", "Volume", "RelativeCount", "RelativeVolume"}
+
+	stringify := func(key Key) []string {
+		return []string{
+			key.(MyKey).dest_ip,
+			key.(MyKey).ASN,
+		}
+	}
+	NilKey := func() Key {
+		return MyKey{dest_ip: "", ASN: ""}
+	}
+	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
+		layerClass := gopacket.NewLayerClass([]gopacket.LayerType{layers.LayerTypeTCP})
+
+		layer := packet.LayerClass(layerClass)
+		if layer == nil {
+			return NilKey()
+		}
+		if layer.LayerType() == layers.LayerTypeTCP {
+			tcp, ok := layer.(*layers.TCP)
+			if ok && (tcp.ACK || tcp.RST) {
+				return MyKey{
+					dest_ip: packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4).SrcIP.String(),
+					ASN:     metadata.SrcASN,
+				}
+			}
+		}
+		return NilKey()
+	}
+
+	if len(stringify(NilKey())) != len(header)-4 {
+		panic("header length does not match key length")
+	}
+
+	return filename, header, processData(decoratedPacketChannel, constructKey, NilKey, stringify)
 }
 
 func WriteCsv(filename string, header []string, table [][]string) {
@@ -207,40 +364,31 @@ func WriteCsv(filename string, header []string, table [][]string) {
 	}
 }
 
-func loadPcaps(filepath string, packetChannel chan gopacket.Packet, wg *sync.WaitGroup) {
-	defer wg.Done()
+func loadData(fileNameWithoutExtension string,
+	decoratedPacketChannel chan DecoratedPacket,
+	waitGroup *sync.WaitGroup) {
 
 	fmt.Print("o")
 	defer fmt.Print("x")
-	handle, err := pcap.OpenOffline(filepath)
+
+	file, _ := os.Open("data/raw/metadata/" + fileNameWithoutExtension + ".json")
+
+	handle, err := pcap.OpenOffline("data/raw/pcapsanon/" + fileNameWithoutExtension + ".pcap")
 	if err != nil {
 		fmt.Println("HERE" + err.Error())
 	}
-
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	for packet := range packetSource.Packets() {
-		packetChannel <- packet
-	}
-
-}
-
-func loadMetadata(filepath string, metadataChannel chan Metadata, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	fmt.Print("o")
-	defer fmt.Print("x")
-
-	file, _ := os.Open(filepath)
-
 	decoder := json.NewDecoder(file)
 	decoder.Token()
 
-	for decoder.More() {
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	for packet := range packetSource.Packets() {
 		metadata := Metadata{}
 		_ = decoder.Decode(&metadata)
-		metadataChannel <- metadata
+
+		decoratedPacketChannel <- DecoratedPacket{packet, metadata}
 	}
 
+	waitGroup.Done()
 }
 
 type Metadata struct {
@@ -255,36 +403,49 @@ type Metadata struct {
 	KnownScanner   string
 }
 
-func main() {
-	pcap, _ := ioutil.ReadDir("data/raw/pcapsanon/")
-	metadata, _ := ioutil.ReadDir("data/raw/metadata/")
-	packetChannel := make(chan gopacket.Packet, 0)
-	metadataChannel := make(chan Metadata, 0)
+func GetNameWithoutExtension(fileName string) string {
+	return fileName[:len(fileName)-len(filepath.Ext(fileName))]
+}
 
-	K := len(pcap)
+func run(processor func(<-chan DecoratedPacket) (string, []string, [][]string)) {
+	files, _ := ioutil.ReadDir("data/raw/pcapsanon/")
+
+	files = files[:]
+
+	decoratedPacketChannel := make(chan DecoratedPacket)
 
 	waitGroup := sync.WaitGroup{}
-	// waitGroup.Add(len(pcap) + len(metadata))
-	waitGroup.Add(K + K)
+	waitGroup.Add(len(files))
 
 	go func() {
 		waitGroup.Wait()
 		fmt.Println("\nclosing")
-		close(packetChannel)
-		close(metadataChannel)
+		close(decoratedPacketChannel)
 	}()
 
-	for i := 0; i < K; i++ {
-		go loadPcaps("data/raw/pcapsanon/"+pcap[i].Name(), packetChannel, &waitGroup)
-		go loadMetadata("data/raw/metadata/"+metadata[i].Name(), metadataChannel, &waitGroup)
+	for i := 0; i < len(files); i++ {
+		go loadData(GetNameWithoutExtension(files[i].Name()), decoratedPacketChannel, &waitGroup)
 	}
 	time.Sleep(time.Second)
 	fmt.Println()
 
-	fmt.Println(flag.Args())
-	processor := VolumeBySourceAS
-
-	filename, header, table := processor(packetChannel, metadataChannel)
+	filename, header, table := processor(decoratedPacketChannel)
 
 	WriteCsv(filename, header, table)
+}
+
+func main() {
+
+	processors := map[string]func(<-chan DecoratedPacket) (string, []string, [][]string){
+		// "TimeSeriesHourCountry": TimeSeriesHourCountry,
+		// "VolumeBySourceCountry": VolumeBySourceCountry,
+		// "VolumeBySourceAS":      VolumeBySourceAS,
+		"VolumeByProtocolPort": VolumeByProtocolPort,
+		// "ScannerAnalysis":     ScannerAnalysis,
+		// "InternetBackscatter": InternetBackscatter,
+	}
+	for name, processor := range processors {
+		fmt.Println("running", name)
+		run(processor)
+	}
 }
