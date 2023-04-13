@@ -113,7 +113,7 @@ func VolumeByProtocolPort(decoratedPacketChannel <-chan DecoratedPacket) (string
 		return []string{key.(MyKey).Protocol, fmt.Sprintf("%d", key.(MyKey).Port)}
 	}
 
-	layerClass := gopacket.NewLayerClass([]gopacket.LayerType{layers.LayerTypeTCP, layers.LayerTypeUDP, layers.LayerTypeICMPv4})
+	layerClass := gopacket.NewLayerClass([]gopacket.LayerType{layers.LayerTypeTCP, layers.LayerTypeUDP, layers.LayerTypeICMPv4, layers.LayerTypeICMPv6})
 
 	constructKey := func(packet gopacket.Packet, metadata Metadata) Key {
 		key := MyKey{Protocol: packet.NetworkLayer().(*layers.IPv4).Protocol.String(), Port: -1}
